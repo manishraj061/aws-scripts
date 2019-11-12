@@ -1,0 +1,216 @@
+#!/usr/bin/env python
+
+import requests
+import json
+import os
+import time
+import ast
+import logging
+import boto3
+import botocore
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+max_boto_retries = 30
+max_delay = 30
+
+url = 'http://' + os.environ['api_gw_lb_name'] + \
+    ':8080/' + os.environ['netcool_api_path'] + "/"
+
+splunk_processes = ['splunkd', 'collectd', 'python']
+
+default_headers = {
+    'Authorization': 'Basic dGl2b2xpOm5ldGNvb2w=',
+    'Cache-Control': 'no-cache',
+    'Content-Type': 'application/json',
+    'Postman-Token': '3efbcebe-eb49-4124-a36f-66cca47124c8'
+}
+
+default_payload = {
+    'AlertGroup': 'cloudops',
+    'AlertKey': 'cwkeydefault',
+    'Application': 'cwappdefault',
+    'EventId': '0001',
+    'Instance': 'cwinstancedefault',
+    'Node': 'cwnodedefault',
+    'Agent': 'cwagent',
+    'Service': 'cwservicedefault',
+    'Severity': 2,
+    'Summary': 'Alert summary',
+    'Component': 'cwcompdefault',
+    'NodeAlias': 'cwapinodedefault'
+}
+
+
+def check_boto_exception(e, i):
+    """
+    This function checks boto exceptions and manages potential api hold off errors
+    :param
+        e is an exception and
+        i is a count integer
+    :return:
+        boto_retry is a boolean
+    """
+    boto_retry = False
+    if i < max_boto_retries - 1:
+        if "Request limit exceeded" in e.response['Error']['Message']:
+            print("AWS API hold off error - pause before retry:")
+            time.sleep(3)
+            boto_retry = True
+        else:
+            raise e
+    else:
+        raise e
+    return boto_retry
+
+
+def get_ec2_client_connection():
+    """
+    This function creates an ec2 client connection object.
+    :return: ec2_conn boto3 class
+    """
+    ec2_conn = boto3.client('ec2')
+    return ec2_conn
+
+
+def get_instance_hostname(instance_id):
+    instance = ''
+    ec2 = get_ec2_client_connection()
+    for i in range(max_boto_retries):
+        try:
+            instance = ec2.describe_instances(
+                InstanceIds=[instance_id]
+            )
+        except botocore.exceptions.ClientError as e:
+            boto_retry = check_boto_exception(e, i)
+            if boto_retry:
+                continue
+        break
+    hostname = ''
+    if instance:
+        for r in instance['Reservations']:
+            for i in r['Instances']:
+                for t in i['Tags']:
+                    if t['Key'] == 'Name':
+                        hostname = t['Value']
+    return hostname
+
+
+def merge_payload_dicts(func_default_payload, func_inbound_payload):
+    func_merged_dic = func_default_payload.copy()
+    func_merged_dic.update(func_inbound_payload)
+    return func_merged_dic
+
+
+def process_sns_cw_alert(func_sns_event_record):
+    cw_alarm_name = func_sns_event_record.get('AlarmName')
+    aws_account_id = func_sns_event_record.get('AWSAccountId')
+
+    # Assess the CW alarm name to build out the netcool fields
+    if len(cw_alarm_name.split("-")) == 8:
+        # The alarm has followed the naming convention to reach the CloudOps team
+        cw_group = "cloudops"
+        cw_app, cw_env, cw_instpre, cw_instpost, cw_comp, cw_metric, cw_status, \
+            cw_agent = cw_alarm_name.split("-")
+    elif len(cw_alarm_name.split("-")) == 9:
+        cw_group, cw_app, cw_env, cw_instpre, cw_instpost, cw_comp, cw_metric, cw_status, \
+            cw_agent = cw_alarm_name.split("-")
+    else:
+        cw_group = "cloudops"
+        cw_app = "cloudwatch"
+        cw_env = aws_account_id
+        cw_instpre = "na"
+        cw_instpost = cw_alarm_name
+        cw_comp = "cloudwatch"
+        cw_metric = "alarmname"
+        cw_status = "unexpected"
+        cw_agent = "cwalarm"
+
+    if cw_instpre == "na":
+        cw_instance = cw_instpost
+    else:
+        cw_instance = cw_instpre + "-" + cw_instpost
+
+    cw_summary = "Alarm for " + cw_group + " in AWS account " + cw_env + " " + aws_account_id + \
+                 " for " + cw_comp + " with ID " + cw_instance + " triggered by " + \
+                 cw_metric + " " + cw_status
+
+    cw_node = cw_instance
+    cw_alertkey = cw_metric + cw_status
+
+    ##### WILL THINK OF A WAY TO EXTERNALISE THIS REFERENCE / LOOKUP STUFF
+    if (cw_instpre != "na") and (cw_app.startswith('splunk')) and (cw_metric in splunk_processes):
+        hostname = get_instance_hostname(cw_instance)
+        if hostname:
+            cw_node = hostname
+        cw_group = 'collectd'
+        cw_alertkey = cw_metric + "-" + cw_status
+
+    func_json_payload = {
+        'AlertGroup': cw_group,
+        'AlertKey': cw_alertkey,
+        'Application': cw_app,
+        'Instance': cw_instance,
+        'Node': cw_node,
+        'Agent': cw_agent,
+        'Service': cw_app,
+        'Component': cw_comp,
+        'Summary': cw_summary,
+        'EventId': '0001',
+        'Severity': 2,
+        'NodeAlias': os.environ['api_gw_lb_name']
+    }
+
+    return func_json_payload
+
+
+def post_to_netcool(func_headers, func_payload):
+    logging.info("Message to post : " + str(json.dumps(func_payload)))
+    response = requests.post(url, data=json.dumps(
+        func_payload), headers=func_headers)
+    return response
+
+
+def clean_unicode_to_json(func_message_in):
+    # CloudWatch has a bad habit of sending invalid nulls instead of None which invalidates the json
+    func_message_in = func_message_in.replace(u"null,", u"None,")
+    # Convert from unicode to string / json
+    return_message = ast.literal_eval(func_message_in)
+    return return_message
+
+
+def lambda_handler(event, context):
+    logging.info("Event received : " + str(event))
+    inbound_payload = ""
+    if 'Records' in event:
+        for record in event['Records']:
+            if 'aws:sns' == record['EventSource'] and record['Sns']['Message']:
+                sns_msg = record['Sns']['Message']
+                if isinstance(sns_msg, unicode):
+                    sns_msg = clean_unicode_to_json(sns_msg)
+                else:
+                    # Assume that its already a valid and clean dic
+                    sns_msg = sns_msg
+                if 'AlarmName' in sns_msg:
+                    # Then this is a CW alert via SNS and we need to extract the
+                    # appropriate fields to hit Netcool
+                    inbound_payload = process_sns_cw_alert(sns_msg)
+                else:
+                    # Then this is a non CW SNS message and we will assume the
+                    # JSON structure of the message matches what Netcool requires
+                    inbound_payload = sns_msg
+    else:
+        # If its not an SNS message then lets assume its raw json in the required
+        # format with the Netcool fields
+        if isinstance(event, unicode):
+            inbound_payload = clean_unicode_to_json(event)
+        else:
+            inbound_payload = event
+
+    # Merge the data passed to the function with the default values to make sure all required fields populated
+    full_payload = merge_payload_dicts(default_payload, inbound_payload)
+
+    # Now post the message
+    post_response = post_to_netcool(default_headers, full_payload)
+    logging.info("Message posted and response was : " +
+                 str(post_response.status_code) + str(post_response.reason))
